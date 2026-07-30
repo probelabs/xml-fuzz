@@ -1,0 +1,2 @@
+<!ENTITY % nested SYSTEM "file:///workspace/xml-fuzz/fixtures/sandbox/pe.dtd">
+%nested;

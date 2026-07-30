@@ -1,0 +1,35 @@
+[package]
+name = "xml_fuzz"
+version = "0.1.0"
+edition = "2021"
+description = "Structure-aware XML fuzzer: grammar-based generators, XML-aware mutations, corpus, and correctness gates for any XML parser"
+license = "MIT"
+repository = "https://github.com/probelabs/xml-fuzz"
+homepage = "https://github.com/probelabs/xml-fuzz"
+documentation = "https://docs.rs/xml_fuzz"
+readme = "README.md"
+keywords = ["xml", "fuzzing", "fuzzer", "parser", "libxml2"]
+categories = ["development-tools::testing", "development-tools::debugging"]
+exclude = ["harness/libxml2_parse", "harness/libxml2_all_apis", "corpus_export", "crashes", "target"]
+
+[dependencies]
+rand = "0.8"
+
+[dev-dependencies]
+proptest = "1"
+
+[[example]]
+name = "fuzz_loop"
+path = "examples/fuzz_loop.rs"
+
+[[example]]
+name = "fuzz_all_libxml2"
+path = "examples/fuzz_all_libxml2.rs"
+
+[[example]]
+name = "long_campaign"
+path = "examples/long_campaign.rs"
+
+[[example]]
+name = "export_seeds"
+path = "examples/export_seeds.rs"

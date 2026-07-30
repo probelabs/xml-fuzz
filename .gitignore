@@ -1,0 +1,8 @@
+harness/libxml2_parse
+harness/libxml2_all_apis
+/target
+/crashes
+/corpus_export
+*.gcda
+*.gcno
+default.profraw
