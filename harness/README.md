@@ -39,7 +39,31 @@ echo '<r/>' | ./libxml2_all_apis --api=io-callback
 
 Dual-input marker: `\n---SPLIT---\n`.
 
+## Persistent worker (resource oracles)
+
+One-shot spawn hides leaks (process exit reclaims heap). For RSS/CPU/thread/FD
+growth across cases:
+
+```sh
+./libxml2_all_apis --worker
+# stdin protocol (binary-safe):
+#   JOB <api> <opts_int> <chunk> <nbytes>\n
+#   <nbytes raw bytes>
+#   QUIT\n
+# stdout per job:
+#   RES ok=0|1 elapsed_ms=N rss_kb=N rss_delta_kb=N threads=N fds=N cpu_user_ms=N cpu_sys_ms=N
+```
+
+Parallel campaigns: **N separate `--worker` processes** (one measurement domain
+each). Do not share one worker across threads without a lock. Prefer serial
+workers when hunting slow leaks; use `XML_FUZZ_MEASURE=1` on
+`resource_campaign` before multi-worker throughput runs.
+
+Fingerprints still go to stderr; only the `RES` line is on stdout.
+
 ## Env vars (Rust)
 
 - `XML_FUZZ_LIBXML2_HARNESS` → `libxml2_parse`
 - `XML_FUZZ_LIBXML2_ALL` → `libxml2_all_apis`
+- `XML_FUZZ_WORKERS` → isolated worker process count (resource campaign)
+- `XML_FUZZ_MEASURE` → serial-vs-N contention probe

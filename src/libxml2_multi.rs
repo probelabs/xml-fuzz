@@ -22,18 +22,28 @@ pub struct LibXml2MultiHarness {
 
 impl LibXml2MultiHarness {
     pub fn discover() -> Option<Self> {
-        let candidates = [
-            std::env::var_os("XML_FUZZ_LIBXML2_ALL").map(PathBuf::from),
-            Some(PathBuf::from("harness/libxml2_all_apis")),
-            Some(PathBuf::from(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/harness/libxml2_all_apis"
-            ))),
-            Some(PathBuf::from(
-                "/tmp/grok-goal-4c506ec6e592/implementer/libxml2_all_apis",
-            )),
+        // Prefer explicit env, then fast (no-ASan) if requested, then default ASan.
+        let prefer_fast = std::env::var_os("XML_FUZZ_FAST")
+            .map(|v| v == "1" || v == "true" || v == "yes")
+            .unwrap_or(false);
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(p) = std::env::var_os("XML_FUZZ_LIBXML2_ALL") {
+            candidates.push(PathBuf::from(p));
+        }
+        let roots = [
+            PathBuf::from("harness"),
+            PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/harness")),
         ];
-        for c in candidates.into_iter().flatten() {
+        for root in &roots {
+            if prefer_fast {
+                candidates.push(root.join("libxml2_all_apis_fast"));
+            }
+            candidates.push(root.join("libxml2_all_apis"));
+            if !prefer_fast {
+                candidates.push(root.join("libxml2_all_apis_fast"));
+            }
+        }
+        for c in candidates {
             if c.is_file() {
                 return Some(Self {
                     binary: c,

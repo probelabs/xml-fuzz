@@ -19,13 +19,32 @@
  *   - reader-ops: optional OPS ---SPLIT--- DOC (else first bytes are ops)
  *
  * Stderr fingerprint lines: api= mode= root= text= text_len= elapsed_ms=
+ * plus resource lines: rss_kb= rss_delta_kb= threads= fds= cpu_user_ms= cpu_sys_ms=
+ *
+ * Persistent worker mode (for leak / growth detection across cases):
+ *   libxml2_all_apis --worker
+ * Protocol on stdin (binary-safe):
+ *   JOB <api> <opts_int> <chunk> <nbytes>\n
+ *   <nbytes raw bytes>
+ *   QUIT\n
+ * One RES line on stdout per job:
+ *   RES ok=0|1 elapsed_ms=N rss_kb=N rss_delta_kb=N threads=N fds=N cpu_user_ms=N cpu_sys_ms=N
+ * Fingerprints still go to stderr.
+ *
  * Exit: 0 accept-ish, 1 clean fail, 2 harness error
+ *
+ * Parallel campaigns: use N separate --worker processes (one measurement
+ * domain each). Do not share one worker across threads without a lock.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <errno.h>
+#include <stdint.h>
+#include <sys/resource.h>
 
 #include <libxml/parser.h>
 #include <libxml/tree.h>
@@ -71,6 +90,128 @@ static long ms_since(const struct timespec *t0) {
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     return (t1.tv_sec - t0->tv_sec) * 1000L + (t1.tv_nsec - t0->tv_nsec) / 1000000L;
+}
+
+/* ---- process resource sampling (Linux /proc; best-effort elsewhere) ---- */
+
+typedef struct {
+    long rss_kb;
+    long threads;
+    long fds;
+    long cpu_user_ms;
+    long cpu_sys_ms;
+} ResourceSnap;
+
+static long read_rss_kb(void) {
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long rss = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            sscanf(line + 6, "%ld", &rss);
+            break;
+        }
+    }
+    fclose(f);
+    return rss;
+#else
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return -1;
+    /* ru_maxrss is KB on Linux, bytes on macOS — we primarily target Linux ASan. */
+    return (long)ru.ru_maxrss;
+#endif
+}
+
+static long count_threads(void) {
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long n = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "Threads:", 8) == 0) {
+            sscanf(line + 8, "%ld", &n);
+            break;
+        }
+    }
+    fclose(f);
+    return n;
+#else
+    return -1;
+#endif
+}
+
+static long count_fds(void) {
+#ifdef __linux__
+    DIR *d = opendir("/proc/self/fd");
+    if (!d) return -1;
+    long n = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        n++;
+    }
+    closedir(d);
+    return n;
+#else
+    return -1;
+#endif
+}
+
+static void cpu_times_ms(long *user_ms, long *sys_ms) {
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+        *user_ms = -1;
+        *sys_ms = -1;
+        return;
+    }
+    *user_ms = (long)(ru.ru_utime.tv_sec * 1000L + ru.ru_utime.tv_usec / 1000L);
+    *sys_ms = (long)(ru.ru_stime.tv_sec * 1000L + ru.ru_stime.tv_usec / 1000L);
+}
+
+static ResourceSnap resource_snap(void) {
+    ResourceSnap s;
+    s.rss_kb = read_rss_kb();
+    s.threads = count_threads();
+    s.fds = count_fds();
+    cpu_times_ms(&s.cpu_user_ms, &s.cpu_sys_ms);
+    return s;
+}
+
+static void emit_resource(const ResourceSnap *before, const ResourceSnap *after, long elapsed_ms) {
+    long rss_delta = -1;
+    if (before->rss_kb >= 0 && after->rss_kb >= 0)
+        rss_delta = after->rss_kb - before->rss_kb;
+    long cpu_user_d = -1, cpu_sys_d = -1;
+    if (before->cpu_user_ms >= 0 && after->cpu_user_ms >= 0)
+        cpu_user_d = after->cpu_user_ms - before->cpu_user_ms;
+    if (before->cpu_sys_ms >= 0 && after->cpu_sys_ms >= 0)
+        cpu_sys_d = after->cpu_sys_ms - before->cpu_sys_ms;
+    fprintf(stderr,
+            "rss_kb=%ld\nrss_delta_kb=%ld\nthreads=%ld\nfds=%ld\n"
+            "cpu_user_ms=%ld\ncpu_sys_ms=%ld\nelapsed_ms=%ld\n",
+            after->rss_kb, rss_delta, after->threads, after->fds,
+            cpu_user_d, cpu_sys_d, elapsed_ms);
+}
+
+static void emit_res_line(int ok, const ResourceSnap *before, const ResourceSnap *after,
+                          long elapsed_ms, FILE *out) {
+    long rss_delta = -1;
+    if (before->rss_kb >= 0 && after->rss_kb >= 0)
+        rss_delta = after->rss_kb - before->rss_kb;
+    long cpu_user_d = -1, cpu_sys_d = -1;
+    if (before->cpu_user_ms >= 0 && after->cpu_user_ms >= 0)
+        cpu_user_d = after->cpu_user_ms - before->cpu_user_ms;
+    if (before->cpu_sys_ms >= 0 && after->cpu_sys_ms >= 0)
+        cpu_sys_d = after->cpu_sys_ms - before->cpu_sys_ms;
+    fprintf(out,
+            "RES ok=%d elapsed_ms=%ld rss_kb=%ld rss_delta_kb=%ld threads=%ld fds=%ld "
+            "cpu_user_ms=%ld cpu_sys_ms=%ld\n",
+            ok, elapsed_ms, after->rss_kb, rss_delta, after->threads, after->fds,
+            cpu_user_d, cpu_sys_d);
+    fflush(out);
 }
 
 static void emit_text(const char *text) {
@@ -986,13 +1127,109 @@ static const char *ALL_APIS[] = {
     NULL
 };
 
+static int run_one_job(const char *api, const unsigned char *buf, size_t len,
+                       int opts, int chunk, int emit_stdout_res) {
+    ResourceSnap before = resource_snap();
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    int any_ok = 0;
+    if (!strcmp(api, "all")) {
+        for (int i = 0; ALL_APIS[i]; i++) {
+            fprintf(stderr, "--- begin %s ---\n", ALL_APIS[i]);
+            emit_hdr(ALL_APIS[i], 0);
+            int ok = dispatch(ALL_APIS[i], buf, len, opts, chunk);
+            fprintf(stderr, "result=%s\n", ok ? "ok" : "fail");
+            if (ok) any_ok = 1;
+        }
+    } else {
+        emit_hdr(api, 0);
+        any_ok = dispatch(api, buf, len, opts, chunk);
+    }
+
+    long elapsed = ms_since(&t0);
+    ResourceSnap after = resource_snap();
+    emit_resource(&before, &after, elapsed);
+    if (emit_stdout_res)
+        emit_res_line(any_ok ? 1 : 0, &before, &after, elapsed, stdout);
+    return any_ok;
+}
+
+/*
+ * Persistent worker: one process, many jobs — required for rss_delta / thread
+ * growth across cases. Serial protocol only (one job at a time).
+ */
+static int worker_main(void) {
+    xmlInitParser();
+    xmlSetGenericErrorFunc(NULL, discard_errors);
+    /* Warm /proc and allocator so first-job delta is less noisy */
+    (void)resource_snap();
+
+    char header[512];
+    while (fgets(header, sizeof(header), stdin)) {
+        if (!strncmp(header, "QUIT", 4))
+            break;
+        char api[128];
+        unsigned long opts_ul = 0, chunk_ul = 17, nbytes = 0;
+        if (sscanf(header, "JOB %127s %lu %lu %lu", api, &opts_ul, &chunk_ul, &nbytes) != 4) {
+            fprintf(stdout, "RES ok=0 elapsed_ms=0 rss_kb=-1 rss_delta_kb=-1 threads=-1 fds=-1 "
+                            "cpu_user_ms=-1 cpu_sys_ms=-1 err=bad_header\n");
+            fflush(stdout);
+            continue;
+        }
+        if (nbytes > 16 * 1024 * 1024UL) {
+            fprintf(stdout, "RES ok=0 elapsed_ms=0 rss_kb=-1 rss_delta_kb=-1 threads=-1 fds=-1 "
+                            "cpu_user_ms=-1 cpu_sys_ms=-1 err=too_large\n");
+            fflush(stdout);
+            /* drain */
+            unsigned char drain[4096];
+            size_t left = nbytes;
+            while (left) {
+                size_t n = left > sizeof(drain) ? sizeof(drain) : left;
+                size_t r = fread(drain, 1, n, stdin);
+                if (r == 0) break;
+                left -= r;
+            }
+            continue;
+        }
+        unsigned char *buf = malloc(nbytes ? nbytes : 1);
+        if (!buf) {
+            fprintf(stdout, "RES ok=0 elapsed_ms=0 rss_kb=-1 rss_delta_kb=-1 threads=-1 fds=-1 "
+                            "cpu_user_ms=-1 cpu_sys_ms=-1 err=oom\n");
+            fflush(stdout);
+            return 2;
+        }
+        size_t got = 0;
+        while (got < nbytes) {
+            size_t r = fread(buf + got, 1, nbytes - got, stdin);
+            if (r == 0) break;
+            got += r;
+        }
+        if (got != nbytes) {
+            free(buf);
+            fprintf(stdout, "RES ok=0 elapsed_ms=0 rss_kb=-1 rss_delta_kb=-1 threads=-1 fds=-1 "
+                            "cpu_user_ms=-1 cpu_sys_ms=-1 err=short_read\n");
+            fflush(stdout);
+            continue;
+        }
+        int chunk = chunk_ul < 1 ? 1 : (int)chunk_ul;
+        int opts = (int)opts_ul;
+        fprintf(stderr, "--- worker job api=%s nbytes=%lu ---\n", api, nbytes);
+        (void)run_one_job(api, buf, nbytes, opts, chunk, /*emit_stdout_res=*/1);
+        free(buf);
+    }
+    xmlCleanupParser();
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *api = "xml-memory";
     const char *path = NULL;
-    int opts = 0, chunk = 17, do_all = 0;
+    int opts = 0, chunk = 17, do_all = 0, worker = 0;
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--api=", 6)) api = argv[i] + 6;
         else if (!strcmp(argv[i], "--all")) do_all = 1;
+        else if (!strcmp(argv[i], "--worker")) worker = 1;
         else if (!strcmp(argv[i], "--noent")) opts |= XML_PARSE_NOENT;
         else if (!strcmp(argv[i], "--dtdload")) opts |= XML_PARSE_DTDLOAD;
         else if (!strcmp(argv[i], "--dtdattr")) opts |= XML_PARSE_DTDATTR;
@@ -1006,6 +1243,9 @@ int main(int argc, char **argv) {
     }
     if (chunk < 1) chunk = 1;
 
+    if (worker)
+        return worker_main();
+
     FILE *in = path ? fopen(path, "rb") : stdin;
     if (!in) return 2;
     size_t len = 0;
@@ -1013,26 +1253,11 @@ int main(int argc, char **argv) {
     if (path) fclose(in);
     if (!buf) return 2;
 
-    struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
     xmlInitParser();
     xmlSetGenericErrorFunc(NULL, discard_errors);
 
-    int any_ok = 0;
-    if (do_all || !strcmp(api, "all")) {
-        for (int i = 0; ALL_APIS[i]; i++) {
-            fprintf(stderr, "--- begin %s ---\n", ALL_APIS[i]);
-            emit_hdr(ALL_APIS[i], 0);
-            int ok = dispatch(ALL_APIS[i], buf, len, opts, chunk);
-            fprintf(stderr, "result=%s\n", ok ? "ok" : "fail");
-            if (ok) any_ok = 1;
-        }
-        emit_hdr("all", ms_since(&t0));
-    } else {
-        emit_hdr(api, 0);
-        any_ok = dispatch(api, buf, len, opts, chunk);
-        fprintf(stderr, "elapsed_ms=%ld\n", ms_since(&t0));
-    }
+    const char *api_run = do_all ? "all" : api;
+    int any_ok = run_one_job(api_run, buf, len, opts, chunk, /*emit_stdout_res=*/0);
 
     free(buf);
     xmlCleanupParser();

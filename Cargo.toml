@@ -33,3 +33,7 @@ path = "examples/long_campaign.rs"
 [[example]]
 name = "export_seeds"
 path = "examples/export_seeds.rs"
+
+[[example]]
+name = "resource_campaign"
+path = "examples/resource_campaign.rs"

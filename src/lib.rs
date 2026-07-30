@@ -42,8 +42,14 @@ pub mod libxml2_multi;
 pub mod libxml2_target;
 pub mod mutate;
 pub mod option_matrix;
+pub mod resource;
 pub mod stub_parser;
 pub mod xxe_policy;
+
+pub use resource::{
+    check_resource, discover_multi_harness, libxml_options_mask, ResourceBudgets, ResourceSample,
+    ResourceWorker, WorkerPool,
+};
 
 pub use apis::{gen_for_api, LibXml2Api};
 pub use differential::{

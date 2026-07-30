@@ -141,6 +141,46 @@ XML_FUZZ_SECONDS=120 cargo run --example long_campaign --release
 XML_FUZZ_SECONDS=5 XML_FUZZ_ITERS=20 cargo run --example long_campaign
 ```
 
+## Resource oracles (leaks / growth / threads / FDs)
+
+Spawning a **new process per case** reclaims heap on exit, so leaks are
+invisible. The multi-API harness supports a **persistent worker**:
+
+```text
+libxml2_all_apis --worker
+  → JOB <api> <opts_mask> <chunk> <nbytes>\n  + raw body
+  ← RES ok=… elapsed_ms=… rss_kb=… rss_delta_kb=… threads=… fds=… cpu_user_ms=… cpu_sys_ms=…
+```
+
+Rust side: `resource::{ResourceWorker, ResourceBudgets, check_resource}` and
+`examples/resource_campaign.rs`.
+
+### Parallelism policy
+
+| Mode | How | When |
+|------|-----|------|
+| **`XML_FUZZ_WORKERS=1` (default)** | One long-lived process, serial jobs | **Leak / RSS growth oracles** — trustworthy baseline and cumulative growth |
+| **`XML_FUZZ_WORKERS=N`** | N isolated processes, one thread each | Throughput only after measure looks clean |
+| **`XML_FUZZ_MEASURE=1`** | Same job list, serial then N-way | Decide if multi-worker noise is acceptable |
+
+Do **not** share one worker across threads without a lock. Multi-worker still
+keeps **one job at a time per process**, so each process’s RSS domain stays pure;
+host CPU contention can still inflate `elapsed_ms`.
+
+```sh
+bash harness/build.sh
+export XML_FUZZ_LIBXML2_ALL=$PWD/harness/libxml2_all_apis
+# accurate resource campaign (recommended)
+XML_FUZZ_SECONDS=60 cargo run --example resource_campaign --release
+# contention probe before enabling multi-worker for speed
+XML_FUZZ_MEASURE=1 XML_FUZZ_WORKERS=4 XML_FUZZ_ITERS=200 \
+  cargo run --example resource_campaign --release
+```
+
+Example measure verdict on a busy host (ASan harness): ~1.6× speedup with 4
+workers, but higher `rss_delta` noise and ~2× mean elapsed — keep **workers=1**
+for leak hunting; multi-worker is optional for throughput after the probe.
+
 ## Corpus export
 
 Export curated corpus entries (by family) plus a generated batch, and refresh

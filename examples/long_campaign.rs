@@ -88,14 +88,22 @@ fn main() {
     };
 
     let crash_dir = crashes_dir();
+    let fast = std::env::var_os("XML_FUZZ_FAST").is_some()
+        || bin.file_name().and_then(|s| s.to_str()).unwrap_or("").contains("_fast");
     eprintln!(
-        "long_campaign: harness={} seconds={} max_iters={:?} crashes={}",
+        "long_campaign: harness={} seconds={} max_iters={:?} crashes={} sanitize={}",
         bin.display(),
         seconds,
         max_iters,
-        crash_dir.display()
+        crash_dir.display(),
+        if fast { "off(fast)" } else { "asan/unknown" }
     );
     eprintln!("APIs: {}", LibXml2Api::ALL.len());
+    if !fast {
+        eprintln!(
+            "tip: for throughput, build with XML_FUZZ_SANITIZE=0 bash harness/build.sh \\\n     and run with XML_FUZZ_FAST=1 (or XML_FUZZ_LIBXML2_ALL=.../libxml2_all_apis_fast)"
+        );
+    }
 
     let mut harness = LibXml2MultiHarness {
         binary: bin,
